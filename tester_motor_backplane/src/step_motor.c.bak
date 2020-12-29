@@ -1,0 +1,470 @@
+#include "config.h"
+#include "backplane.h"
+
+s_motor sm[3]; 
+unsigned int sm_step[2000]; 
+
+
+// 共约 122383 step
+#define STEP_MOTOR_PULSE_MIN	400		//1.5A 驱动电路，250 开始有风险；
+#define STEP_MOTOR_PULSE_MAX	10000	//20000		// 6000 起步开始有风险；
+#define STEP_MOTOR_PULSE_MIN_INIT	2000	// 初始化 或者 慢慢走阶段 的 限速；
+
+#define STEP_MOTOR_DIR_BOT2TOP	1	
+#define STEP_MOTOR_DIR_TOP2BOT	0
+
+// #define MOTOR_TIMING_BELT	1  // 同步带 或者 滚珠丝杠 
+
+
+
+
+/*  同步带电机       timing belt
+#define STEP_MOTOR_TOTAL_STEP_X	1000000 // 100000 // 42238
+#define STEP_MOTOR_TOTAL_STEP_Y	1050000 //60000// 105000 // 122383
+#define STEP_MOTOR_TOTAL_STEP_Z	70000 //70000 // 7200 // 1223 Z轴没有top开关，必须定义一个比较合适的值
+#define BOARDER_MARGIN				1500
+
+#define MOTOR0_MAX_STEP	20
+#define MOTOR0_MAX_V	30000
+#define MOTOR1_MAX_STEP	20
+#define MOTOR1_MAX_V	30000
+#define MOTOR2_MAX_STEP	10
+#define MOTOR2_MAX_V	40000
+*/
+
+/**************************************
+计算周期固定，计算的粒度，100us 计算一次？
+设置加速的步数  和最大速度，加速度就是 smotor->max_v / smotor->max_step;
+急停：根据加速一共走过的步数，设定为剩余步数，实际上由于摩擦力存在，减速应该可以更快；
+假设 最大速度 100us 100次脉冲，即1us/次，最小速度 100us/次， 加速度为 1次/us；
+总脉冲数为： 100*（1+100）/2 = 5050次；
+
+T1MR0：
+第1us 填入	2500/1 = 2500
+第2us 填入	2500/2 = 1250
+第3us 填入	2500/3 = 833
+第4us 填入	2500/4 = 625
+第50us 填入	2500/50 = 50
+第60us 填入	2500/60 = 42
+第70us 填入	2500/70 = 36
+第80us 填入	2500/80 = 31
+第90us 填入	2500/90 = 28
+第99us 填入	2500/99 = 25
+第100us 填入	2500/100 = 25
+第1us 填入	25
+T1MR0 = _F_PCLK/10000;		// 100us. 填入的值是 25 000 000 /10 000 = 2500
+
+1，从0开始加速；每100us整数倍 更新一次速度 寄存器 的值，假设加速100 次 达成，需要 10ms 多一点，刚起步时候更新比较慢；
+2，每次TIMER1 更新 位移值，如果位移值 达到目标距离的一半，就开始降速，否则加到最大速度后匀速；
+3，根据加速阶段的 step 数量，计算降速点，到达降速点 开始降速；
+
+最快速度： 250（10us） 脉冲开始有风险；
+撞到限位开关之后，急停，延时一段时间之后，等急停完成，然后再延时一段时间 等回退完成，这个过程都忽略限位开关；
+**************************************/
+
+/*
+smotor->min_cycle = 50;
+smotor->max_step = 2000;
+2.0A driver current; 32 micro-step;		// 偶然有风险；
+
+
+*/
+
+
+/* 丝杠电机 */
+#define MOTOR_DRIVER_MICRO_STEP		8
+
+#define STEP_MOTOR_TOTAL_STEP_X	20000 * MOTOR_DRIVER_MICRO_STEP  // 600000 STEP @ 32 mciro step
+#define STEP_MOTOR_TOTAL_STEP_Y	20000 * MOTOR_DRIVER_MICRO_STEP  //60000// 105000 // 122383
+#define STEP_MOTOR_TOTAL_STEP_Z	7300  * MOTOR_DRIVER_MICRO_STEP //70000 // 7200 // 1223 Z轴没有top开关，必须定义一个比较合适的值
+#define BOARDER_MARGIN	4000
+
+// 驱动芯片最大输入频率 100k = 10us = 250 x 40ns 
+// 定时器转载的最小值 只能是 125 （单个边压） ；
+
+#define MOTOR0_MAX_STEP	5000
+#define MOTOR0_MAX_V	(MOTOR0_MAX_STEP * 380)// 350	//130
+#define MOTOR1_MAX_STEP	5000	//100
+#define MOTOR1_MAX_V	(MOTOR1_MAX_STEP * 400) // 380 //150
+#define MOTOR2_MAX_STEP	5000
+#define MOTOR2_MAX_V	(MOTOR1_MAX_STEP * 400)	//200
+
+
+
+// 电机默认方向；
+#define MOTOR0_DIR	0 // 1
+#define MOTOR1_DIR	0 // 1
+#define MOTOR2_DIR	1
+
+
+#define NR_STEP_MOTOR	3
+
+#define STEP_MOTOR_TIMEOUT_100US 	10 * 60000	// 超时
+
+// 坐标和步进电机的设置相关
+
+#define SLA_3933_0		0x15
+#define SLA_3933_1		0x10
+#define SLA_3933_2		0x14
+
+#define ADDR_3933				1	// 3933使用CR01
+
+void set_3933(int motor_idx, signed char step)
+{
+	unsigned char true_hw_value = (step >= 0) ? step : (128 - step);
+	unsigned char sla = (motor_idx == 0) ? SLA_3933_0 :
+						(motor_idx == 1) ? SLA_3933_1 : SLA_3933_2;
+
+	if (i2c_set_NCT3933U_blocking(BUS_ID0, sla, ADDR_3933, true_hw_value) != 0){
+		printk("[%d]set 3933 step[%d] fail.\n", motor_idx, step);
+	}
+
+	g_data_runtime.moter_3933_step[motor_idx] = step;
+}
+
+//	电流设置方式
+//	设置值应在128~255，单位为10uA
+//  step = uA/10 + 128;
+//  电机中电流为 target_current =     uA * 2000 / 5 / 0.1 = 4 * mA
+//
+void motor_goto_mA(unsigned char motor_idx, int mA)
+
+{
+	signed char step = 0x80 + (mA / 40);
+	unsigned char sla = (motor_idx == 0) ? SLA_3933_0 :
+						(motor_idx == 1) ? SLA_3933_1 : SLA_3933_2;
+	if (i2c_set_NCT3933U_blocking(BUS_ID0, sla, ADDR_3933, step) != 0){
+		printk("[%d]set 3933 step[%d] fail.\n", motor_idx, step);
+	}
+}
+
+/*
+	模式设置：
+	  DMODE0  DMODE1  DMODE2
+		L		L		L		0：待机模式
+		L		L		H		1：全步分辨率
+		L		H		L		2：半步分辨率（类型A）
+		L		H		H		3：1/4步分辨率
+		H		L		L		4：半步分辨率（类型B）
+		H		L		H		5：1/8步分辨率
+		H		H		L		6：1/16步分辨率
+		H		H		H		7：1/32步分辨率
+	
+*/
+
+void step_motor_set_current()
+{
+	motor_goto_mA(0, g_motor_config.motor_current[0]);
+	motor_goto_mA(1, g_motor_config.motor_current[1]);
+	motor_goto_mA(2, g_motor_config.motor_current[2]);
+	gpio_set_motor_mode(0, g_motor_config.motor_mode[0]);
+	gpio_set_motor_mode(1, g_motor_config.motor_mode[1]);
+	gpio_set_motor_mode(2, g_motor_config.motor_mode[2]);
+
+}
+
+
+// 对于X轴向的移动检查，暂时只用考虑Xs0边界，X轴左右臂分别处于夹具两端 或 处于夹具右边
+// 当臂低于Zs时，y轴必定小于Ys1
+// 当y轴小于Ys0时，可以自由沿x轴移动
+// 当臂在Ys0与Ys1之间时，夹具处于臂中间或臂左侧
+
+int check_x(unsigned int x_target){
+
+	return 0;
+}
+
+int check_y(unsigned int y_target){
+
+	return 0;
+}
+
+int check_z(unsigned int z_target){
+	return 0;
+
+}
+
+int check_x_y_z(unsigned int x, unsigned int y, unsigned int z)
+{
+	return ((check_x(x) == 0) && (check_y(y) == 0) && (check_z(z) == 0));
+}
+
+void step_motor_goto(unsigned char idx, unsigned int x, unsigned int y, unsigned int z)
+{
+//	static unsigned char zero_loops = 0;
+
+// 除8是为了坐标变换，
+//乘2 是为了避免丢步，因为单数脉冲在换向时候可能被丢了；
+	x >>= 3;	x <<= 1;
+	y >>= 3;	y <<= 1;
+	z >>= 3;	z <<= 1;
+
+
+	if (x > g_motor_config.motor_total_step[0]) x = g_motor_config.motor_total_step[0];
+	if (y > g_motor_config.motor_total_step[1]) y = g_motor_config.motor_total_step[1];
+	if (z > g_motor_config.motor_total_step[2]) z = g_motor_config.motor_total_step[2];
+	
+	
+	sm[0].target_position = x; // (x < BOARDER_LIMIT) ? BOARDER_LIMIT : x; 
+	sm[1].target_position = y; // (y < BOARDER_LIMIT) ? BOARDER_LIMIT : y; 
+	sm[2].target_position = z; // (z < BOARDER_LIMIT) ? BOARDER_LIMIT : z; 
+
+	if ((!x) && (!y) && (!z)) {
+			g_data_runtime.step_motor_init_pending = 1;
+	}
+		
+	step_motor_set_current();
+}
+
+
+void step_motor_init()
+{
+	static char step = 0;
+
+	if (0 == step) {
+		for(unsigned char i = 0; i < 3; i++ )
+			memset(&sm[i], 0, sizeof(sm[0]));		
+
+		IODELAY(40000);// 延迟等残留的中断；
+
+		sm[0].limit_up = g_motor_config.motor_total_step[0];	// STEP_MOTOR_TOTAL_STEP_X;
+		sm[0].max_step = g_motor_config.motor_max_step[0];		// MOTOR0_MAX_STEP;
+		sm[0].max_v = g_motor_config.motor_max_v[0] * 2;		// MOTOR0_MAX_V *2;
+		sm[1].limit_up = g_motor_config.motor_total_step[1];	// STEP_MOTOR_TOTAL_STEP_Y;
+		sm[1].max_step =  g_motor_config.motor_max_step[0]; 	//	MOTOR1_MAX_STEP;
+		sm[1].max_v = g_motor_config.motor_max_v[0] * 2;		// MOTOR1_MAX_V *2;
+		sm[2].limit_up = g_motor_config.motor_total_step[2];	// STEP_MOTOR_TOTAL_STEP_Z;
+		sm[2].max_step = g_motor_config.motor_max_step[0];		// MOTOR2_MAX_STEP;
+		sm[2].max_v = g_motor_config.motor_max_v[0] *2;		// MOTOR2_MAX_V *2;
+
+		sm[0].position = g_motor_config.motor_total_step[0] + (g_motor_config.motor_total_step[0] >> 2);
+		sm[0].target_position = 0;
+		sm[1].position = g_motor_config.motor_total_step[1] + (g_motor_config.motor_total_step[1] >> 2);
+		sm[1].target_position = 0;
+		sm[2].position = g_motor_config.motor_total_step[2] + (g_motor_config.motor_total_step[2] >> 2);
+		sm[2].target_position = 0;
+
+		step = 3;
+
+	} else if (3 == step) {
+		if (sm[0].position != 0)
+			return;
+
+		if (sm[1].position != 0)
+			return;
+		
+		if (sm[2].position != 0)
+			return;
+
+// 修改成正常运行速度
+		sm[0].max_v = g_motor_config.motor_max_step[0]; //  MOTOR0_MAX_V; 
+		sm[1].max_v = g_motor_config.motor_max_step[0]; //  MOTOR1_MAX_V;
+		sm[2].max_v = g_motor_config.motor_max_step[0]; //  MOTOR2_MAX_V;
+
+		printk("step_motor_init done\n");
+		g_data_runtime.step_motor_init_done = 1;
+		g_data_runtime.need_to_update_motors = 0;
+		step = 0;
+	}
+}
+
+
+
+
+void step_motor_start(char motor_idx)
+{
+	if (motor_idx > 3) {
+		printk("motor_idx error: %d\n", motor_idx);
+		return;
+	}
+	s_motor *motor = sm + motor_idx;		
+	
+
+	if (motor->position == motor->target_position) {
+		return;
+	}
+
+	if (motor->position > motor->target_position) {
+		motor->total_pulse = motor->position - motor->target_position;
+		motor->dir = 0;
+	} else {
+		motor->total_pulse = motor->target_position - motor->position;
+		motor->dir = 1;
+	}
+
+printk("M[%d]start %d -> %d [%d]\n" ,motor_idx, motor->position, motor->target_position, motor->total_pulse*4);
+
+
+	if(g_data_runtime.step_motor_init_done){
+		if(motor->total_pulse < 1000){
+			motor->max_v = g_motor_config.motor_max_v[0] * 2; //MOTOR0_MAX_V * 2;
+		}else{
+			motor->max_v = g_motor_config.motor_max_v[0]; // MOTOR0_MAX_V ;
+		}
+	}
+	motor->tick = g_motor_config.motor_accel_start_step[0] << 11; 
+	motor->accl_pulse = 0;
+	motor->current_pulse = 0;
+	motor->step = g_motor_config.motor_accel_start_step[0];
+	motor->interval = motor->max_v / g_motor_config.motor_accel_start_step[0];
+	motor->stampe = g_tick_100us;
+
+	printk("[%d] tick=%d step=%d interval=%d total_pulse=%d/%d/%d\n", motor_idx, motor->tick, motor->step, motor->interval, motor->total_pulse, motor->target_position, motor->position);
+
+	if (0 == motor_idx) {
+		if(motor->dir == MOTOR0_DIR)
+			FIO1SET_bit.P1_17 = 1;
+		else
+			FIO1CLR_bit.P1_17 = 1;
+		T3TC = 0;	
+		T3IR_bit.MR0INT = 1; 
+		T3MR0 = motor->interval;
+		T3TCR_bit.CE = 1;
+/*
+		T1TC = 0;	
+		T1IR_bit.MR0INT = 1; 
+		T1MR0 = motor->interval; 
+		T1TCR_bit.CE = 1;	
+*/
+//		gpio_motor_pulse_x(1);
+	} else if (1 == motor_idx) {
+		if(motor->dir == MOTOR1_DIR)
+			FIO1SET_bit.P1_10 = 1;
+		else
+			FIO1CLR_bit.P1_10 = 1;
+
+		T2TC = 0;	
+		T2IR_bit.MR0INT = 1; 
+		T2MR0 = motor->interval; 
+		T2TCR_bit.CE = 1;
+//		gpio_motor_pulse_y(1);
+	} else {
+		if(motor->dir == MOTOR2_DIR)
+			FIO1SET_bit.P1_25 = 1;
+		else
+			FIO1CLR_bit.P1_25 = 1;
+		T1TC = 0;	
+		T1IR_bit.MR0INT = 1; 
+		T1MR0 = motor->interval; 
+		T1TCR_bit.CE = 1;
+/*		
+		T3TC = 0;	
+		T3IR_bit.MR0INT = 1; 
+		T3MR0 = motor->interval;
+		T3TCR_bit.CE = 1;
+*/
+//		gpio_motor_pulse_z(1);
+	}
+
+}
+
+/*
+回原点的过程，当碰到开关，开始减速到停止，然后往回再走一个安全边界，这个过程开关可能一致触发，需要注意；
+
+*/
+void step_motor_routine( )
+{
+//	static unsigned int stamp = 0;
+
+	volatile s_motor *motor;
+
+	for (unsigned char motor_idx = 0; motor_idx < NR_MOTORS; motor_idx++){
+		char e = 0;
+		motor = sm + motor_idx;
+		if (0 == motor->total_pulse) { //空闲
+		
+			if (motor->step == 0) {
+				if(motor->stampe > 0){
+					printk("M[%d]Done time elapses:	%d\n",motor_idx, (g_tick_100us - motor->stampe) );
+					motor->stampe = 0;
+				}
+			}
+				
+			if (motor->position != motor->target_position) {// 有pending的任务
+				if (motor->target_position > motor->limit_up + 10) // 范围检测；范围异常是不是都不该动？
+					motor->target_position = motor->limit_up;
+				else if (motor->target_position < 0) {
+					printk("---M[%d] T_position: %d\n", motor_idx, motor->target_position);
+					motor->target_position = 0;
+				}
+				debug("-+-M[%d] T_position: %d\n", motor_idx, motor->target_position);	
+				step_motor_start(motor_idx);
+			} 
+		} else {
+
+			if ((is_time_elapsed_100us(STEP_MOTOR_TIMEOUT_100US, motor->stampe))) {  // timeout;
+				e = 3; 
+				
+				g_data_runtime.error_code = 0x10 + motor_idx;
+				motor->stampe = g_tick_100us;
+				g_data_runtime.step_motor_init_done = 0;				
+				printk("M[%d] timeout, stampe=%d tick=%d\n", motor_idx, motor->stampe, g_tick_100us);
+				return;
+			}
+		
+			if(motor->emergency_step ){	//延时等回退；
+				if(motor->position != motor->target_position) {
+					continue;
+				}
+				motor->emergency_step = 0;
+			}
+
+			// 急停检测；
+			if (0 == motor_idx) {// x
+				if (FIO1PIN_bit.P1_15 == 0) { // 靠近电机一头的限位开关定义为 零点；
+					e = 1;
+					printk("X origin\n");
+				}
+			} else if (1 == motor_idx) {	// y
+				if (FIO1PIN_bit.P1_8 == 0) { // 靠近电机一头的限位开关定义为 零点；
+					e = 1;
+					printk("Y origin\n");
+				}
+			} else if (2 == motor_idx) {	// z
+				if (FIO1PIN_bit.P1_27 == 0) { // 靠近电机一头的限位开关定义为 零点；
+					e = 1;
+					printk("Z origin\n");
+				}
+			}
+
+			if (e == 1) {
+				if (!motor->accl_pulse)
+					continue;
+
+				IRQDisable(); 
+				 // 靠近电机一头的限位开关定义为 零点；
+				motor->position = -BOARDER_MARGIN;	//  (motor_idx == 2) ? -(BOARDER_MARGIN * 2) : -BOARDER_MARGIN;	
+				motor->target_position = 0;					
+				motor->total_pulse = (motor->accl_pulse/2);
+				motor->total_pulse += 1; // 避免为0
+				motor->current_pulse = 0; 
+				motor->emergency_step = 1;
+				if (motor_idx == 0) T3TCR_bit.CE = 1;
+				else if (motor_idx == 1) T2TCR_bit.CE = 1;
+				else T1TCR_bit.CE = 1;
+				printk("[%d]pos=%d->%d total_pulse=%d, accl_pulse=%d cur_pulse=%d\n", motor_idx, motor->position, motor->target_position, 
+					motor->total_pulse, motor->accl_pulse, motor->current_pulse);
+				IRQEnable();
+			}		
+		}	
+	}
+
+}
+
+
+
+void print_step_motor_postion()
+{
+	int position[3], target_postion[3];
+	
+	printk("Postion: ");
+	for (int i = 0; i < 3; i++) {
+		position[i] = sm[i].position;
+		target_postion[i] = sm[i].target_position;
+		printk("[%d] %d->%d, ", i, position[i], target_postion[i]);
+	}
+	printk("\n");
+}
+
+
+

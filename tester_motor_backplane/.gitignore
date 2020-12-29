@@ -1,0 +1,10 @@
+*.dep
+/settings
+
+/Output
+
+src/autover.h
+
+/SourceInsight
+*.si4project
+JFlashARM.log
